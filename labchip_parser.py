@@ -20,6 +20,24 @@ def reported_peak_count(page_text):
     return None
 
 
+def legacy_peak_row_count(page_text):
+    """Count visible rows in older LabChip tables without a Peak Count field.
+
+    This is an independent check against the coordinate-based cell parser. A
+    malformed or wrapped row is counted here and must not silently disappear.
+    """
+    lines = page_text.splitlines()
+    for index in range(len(lines) - 1):
+        if not re.fullmatch(r"Sample\s+Name\s+Migration\s+Time\s+%\s+Purity\s+Corr\.", lines[index].strip(), re.I):
+            continue
+        if not re.fullmatch(r"\(sec\)\s*-\s*Center\s+Area", lines[index + 1].strip(), re.I):
+            continue
+        for end in range(index + 2, len(lines)):
+            if re.match(r"LabChip\s+GX\s+Software\b", lines[end], re.I):
+                return sum(bool(line.strip()) for line in lines[index + 2:end])
+    return None
+
+
 def _number(words):
     for word in words:
         value = word["text"].strip().replace(",", "")
@@ -106,6 +124,36 @@ def _header_columns(words, page_width):
     return columns, header_bottom
 
 
+def zero_peak_table_is_empty(page):
+    """Confirm that a reported zero-peak page has no visible table data rows."""
+    words = page.extract_words(x_tolerance=1.5, y_tolerance=2)
+    layout = _header_columns(words, page.width)
+    if layout is None:
+        return False
+    columns, header_bottom = layout
+    sample_left, sample_right = columns["sample"] if "sample" in columns else (0, columns["migration"][0])
+    footer_top = min(
+        (
+            word["top"] for word in words
+            if word["top"] > header_bottom and (
+                word["text"].lower() == "labchip"
+                or (word["text"].lower() == "analysis" and any(
+                    other["text"].lower().rstrip(":") == "version"
+                    and abs(other["top"] - word["top"]) <= 3
+                    for other in words
+                ))
+            )
+        ),
+        default=page.height,
+    )
+    return not any(
+        header_bottom + 1 < word["top"] < footer_top
+        and sample_left <= word["x0"] < sample_right
+        and re.search(r"[A-Za-z\u4e00-\u9fff]", word["text"])
+        for word in words
+    )
+
+
 def parse_labchip_page(page, page_text):
     """Return the app's sample/peak schema, or None for an unsupported page."""
     sample_match = re.search(r"Sample\s*<([^>]+)>\s*Page\b", page_text, re.I)
@@ -187,6 +235,8 @@ def parse_labchip_page(page, page_text):
 
     # A marker-only buffer page has an area but no reportable purity.
     count = reported_peak_count(page_text)
+    if count is None:
+        count = legacy_peak_row_count(page_text)
     if count is None or len(peaks) != count:
         return None
     if not any(peak["Purity"] > 0 for peak in peaks):

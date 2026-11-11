@@ -8,7 +8,7 @@ import pandas as pd
 import pdfplumber
 import streamlit as st
 
-from labchip_parser import parse_labchip_page, reported_peak_count
+from labchip_parser import legacy_peak_row_count, parse_labchip_page, reported_peak_count, zero_peak_table_is_empty
 
 st.set_page_config(page_title="CE-SDS 纯本地提取工具", page_icon="🧪", layout="centered")
 
@@ -59,6 +59,7 @@ if uploaded_file is not None:
                 parsed_data = []
                 errors = []
                 empty_pages = 0
+                empty_samples = []
                 for i, page in enumerate(pages, 1):
                     page_text = page.extract_text() or ""
                     if not page_text:
@@ -71,8 +72,12 @@ if uploaded_file is not None:
                             errors.append(f"第 {i} 页：峰表解析出错（{type(exc).__name__}：{exc}）。")
                         if data:
                             parsed_data.append((i, data))
-                        elif reported_peak_count(page_text) == 0:
+                        elif (reported_peak_count(page_text) == 0 or legacy_peak_row_count(page_text) == 0) and zero_peak_table_is_empty(page):
                             empty_pages += 1
+                            sample_match = re.search(r"Sample\s*<([^>]+)>\s*Page\b", page_text, re.I)
+                            sample_name = sample_match.group(1).strip() if sample_match else ""
+                            if sample_name and not re.search(r"\b(buffer|blank)\b", sample_name, re.I):
+                                empty_samples.append(f"第 {i} 页：{sample_name}")
                         elif not any(error.startswith(f"第 {i} 页：") for error in errors):
                             errors.append(f"第 {i} 页：未识别到峰表，或识别的峰数与报告不一致。")
                     progress_bar.progress(int(i / total_pages * 100))
@@ -80,6 +85,8 @@ if uploaded_file is not None:
 
             if empty_pages:
                 st.info(f"已跳过 {empty_pages} 页无峰样品。")
+            if empty_samples:
+                st.warning("以下非 Buffer/Blank 样品没有峰数据，未写入 Excel，请核对：" + "；".join(empty_samples))
             missing_area_pages = [page_num for page_num, data in parsed_data if data.get("Area Missing")]
             if missing_area_pages:
                 st.warning(
@@ -323,6 +330,13 @@ if uploaded_file is not None:
                                     valid_sum_peaks = peaks_df[peaks_df['Purity'] >= 2.0]
                                     result_row['LC+HC'] = round_half_up_1(valid_sum_peaks['Purity'].sum())
                                 result_row['NGHC'] = 0.0
+                    else:
+                        # A parsed R sample must still appear in the workbook.
+                        # With no peak above the classification threshold, its
+                        # LC/HC or R-MP type cannot be assigned reliably.
+                        result_row['LC+HC'] = '结果见图谱，供参考'
+                        result_row['NGHC'] = '结果见图谱，供参考'
+                        result_row['R-MP'] = '结果见图谱，供参考'
                         
                 all_results.append(result_row)
                 
@@ -339,8 +353,8 @@ if uploaded_file is not None:
                 output_buffer = io.BytesIO()
                 with pd.ExcelWriter(output_buffer, engine='openpyxl') as writer:
                     has_data = False
-                    if 'Fragments' in formatted_df_all.columns:
-                        df_nr = formatted_df_all[['Sample Name', 'Vial', 'Fragments', 'NR-MP/IgG']].dropna(subset=['Fragments', 'NR-MP/IgG'])
+                    if 'Fragments' in df_all.columns:
+                        df_nr = df_all[['Sample Name', 'Vial', 'Fragments', 'NR-MP/IgG']].dropna(subset=['Fragments', 'NR-MP/IgG'])
                         df_nr = df_nr.rename(columns={
                             'Fragments': 'Fragments%',
                             'NR-MP/IgG': 'NR-MP/IgG%'
@@ -349,14 +363,13 @@ if uploaded_file is not None:
                             df_nr.to_excel(writer, sheet_name='Non-Reduced (NR)', index=False)
                             has_data = True
                     
-                    if 'LC+HC' in formatted_df_all.columns or 'R-MP' in formatted_df_all.columns:
+                    if 'LC+HC' in df_all.columns or 'R-MP' in df_all.columns:
                         cols_r = ['Sample Name', 'Vial']
-                        if 'LC+HC' in formatted_df_all.columns: cols_r.append('LC+HC')
-                        if 'NGHC' in formatted_df_all.columns: cols_r.append('NGHC')
-                        if 'R-MP' in formatted_df_all.columns: cols_r.append('R-MP')
+                        if 'LC+HC' in df_all.columns: cols_r.append('LC+HC')
+                        if 'NGHC' in df_all.columns: cols_r.append('NGHC')
+                        if 'R-MP' in df_all.columns: cols_r.append('R-MP')
                         
-                        cols_r = [c for c in cols_r if c in formatted_df_all.columns]
-                        df_r = formatted_df_all[cols_r].dropna(subset=[c for c in cols_r if c not in ['Sample Name', 'Vial']], how='all')
+                        df_r = df_all[cols_r].dropna(subset=[c for c in cols_r if c not in ['Sample Name', 'Vial']], how='all')
                         df_r = df_r.rename(columns={
                             'LC+HC': 'LC+HC%',
                             'NGHC': 'NGHC%',
@@ -365,7 +378,12 @@ if uploaded_file is not None:
                         if not df_r.empty:
                             df_r.to_excel(writer, sheet_name='Reduced (R)', index=False)
                             has_data = True
-                            
+                    for sheet in writer.sheets.values():
+                        for row in sheet.iter_rows(min_row=2, min_col=3):
+                            for cell in row:
+                                if cell.data_type == 'n':
+                                    cell.number_format = '0.0'
+
                 if has_data:
                     st.success("🎉 数据处理完成！请点击下方按钮下载 Excel 报表。")
                     st.balloons()
